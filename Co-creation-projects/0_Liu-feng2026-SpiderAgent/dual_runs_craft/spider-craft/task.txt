@@ -1,0 +1,18 @@
+目标：医疗保障局公共查询
+
+主页：
+https://fuwu.nhsa.gov.cn/nationalHallSt/#/search/medical
+
+接口：
+https://fuwu.nhsa.gov.cn/ebus/fuwu/api/nthl/api/fixed/queryFixedHospital
+
+逆向参数：
+Request Payload:
+- encData
+- signData
+
+Request Headers:
+- x-tif-nonce
+- x-tif-signature
+
+明确要求：本次任务必须使用 spider-craft Skill。

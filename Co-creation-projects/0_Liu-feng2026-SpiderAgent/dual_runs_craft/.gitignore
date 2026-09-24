@@ -1,0 +1,13 @@
+**/.env
+**/__pycache__/
+**/logs/
+**/memory/
+**/notes/
+**/tasks/
+**/tool-output/
+**/js_reverse_cache/
+**/*.process.log
+**/*-live.log
+**/*-live.err.log
+**/run_logged.py
+**/start_logged.py

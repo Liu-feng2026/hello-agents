@@ -1,0 +1,5 @@
+目标：医疗保障局公共查询
+主页：aHR0cHM6Ly9mdXd1Lm5oc2EuZ292LmNuL25hdGlvbmFsSGFsbFN0LyMvc2VhcmNoL21lZGljYWw=
+接口：aHR0cHM6Ly9mdXd1Lm5oc2EuZ292LmNuL2VidXMvZnV3dS9hcGkvbnRobC9hcGkvZml4ZWQvcXVlcnlGaXhlZEhvc3BpdGFs
+逆向参数：Request Payload encData signData；Headers x-tif-nonce x-tif-signature
+要求：使用 spider-king skill
