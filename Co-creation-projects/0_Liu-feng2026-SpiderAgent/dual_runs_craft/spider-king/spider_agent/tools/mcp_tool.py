@@ -15,6 +15,7 @@ class MCPTool(Tool):
         name: str,
         description: str,
         server_command: list[str],
+        env: dict[str, str] | None = None,
     ):
         super().__init__(
             name=name,
@@ -27,6 +28,10 @@ class MCPTool(Tool):
         # 例如：
         # ["npx", "-y", "chrome-devtools-mcp"]
         self.server_command = server_command
+
+        # 传给 MCP Server 子进程的环境变量；
+        # None 表示使用 MCP SDK 的默认继承环境。
+        self.env = env
 
         # 只保护“首次建立连接”这件事，
         # 不限制后续 MCP 子工具的并发调用。
@@ -136,6 +141,7 @@ class MCPTool(Tool):
         return StdioServerParameters(
             command=self.server_command[0],
             args=self.server_command[1:],
+            env=self.env,
         )
 
     async def _ensure_connected(self) -> None:

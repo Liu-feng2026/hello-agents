@@ -114,6 +114,14 @@ class NoteTool(Tool):
             return ToolResponse.error(code="INVALID_PARAM", message="参数验证失败：缺少 action")
 
         action = parameters.get("action")
+        if action in {"create", "update", "delete"}:
+            # 变更类操作打独立日志（证据/任务状态的关键节点一眼可见）；
+            # list/search 等读取操作由上下文构建器每轮轮询，打日志会刷屏。
+            print(
+                f"📝 note.{action}: "
+                f"{parameters.get('title') or parameters.get('note_id') or '(无标题)'}"
+                f" (type={parameters.get('note_type', '-')})"
+            )
         try:
             if action == "create":
                 return self._create_note(parameters)

@@ -1,9 +1,17 @@
 import asyncio
+import logging
 
 from dotenv import load_dotenv
 
 from spider_agent import create_spider_agent
 from spider_agent.tools.mcp_tool import MCPTool
+
+# 全量日志：DEBUG 起所有级别都打到 stdout，SDK 静默重试/超时等动作从此可见。
+# 注意：openai 的 DEBUG 会带完整请求体，日志体积会明显变大（本地文件，可接受）。
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 
 async def main() -> None:

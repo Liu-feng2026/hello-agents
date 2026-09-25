@@ -17,25 +17,45 @@ from hello_agents.context import ContextBuilder, ContextPacket
 class SpiderContextBuilder(ContextBuilder):
     """SpiderAgent 专用上下文构造器。"""
 
-    def __init__(self, note_tool=None, llm=None, *args, **kwargs):
+    def __init__(self, note_tool=None, llm=None, skill_state=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.note_tool = note_tool
         # 启动时复用主 Agent 的 LLM，只用于匹配 task_state。
         self.llm = llm
         # 当前任务唯一的主 task_state ID；首次解析后供后续循环复用。
         self.active_note_id = None
+        # 与主 Agent 共享的可变字典：{"name": str, "content": str}；
+        # Agent 循环在 Skill 工具调用成功后写入，build() 每轮注入 system。
+        self.skill_state = skill_state if skill_state is not None else {}
 
     def build(self, user_query: str, **kwargs) -> str:
         """构建初始上下文，并恢复或创建唯一的主 task_state。"""
         additional_packets = kwargs.pop("additional_packets", []) or []
         system_instructions = kwargs.pop("system_instructions", None)
         task_state_packet = self._build_task_state_packet(user_query)
+        skill_packet = self._build_skill_packet()
+
+        extra_packets = [task_state_packet]
+        if skill_packet is not None:
+            extra_packets.append(skill_packet)
 
         return super().build(
             user_query=user_query,
             system_instructions=system_instructions,
-            additional_packets=additional_packets + [task_state_packet],
+            additional_packets=additional_packets + extra_packets,
             **kwargs,
+        )
+
+    def _build_skill_packet(self):
+        """已加载的 Skill 规程注入 system（与笔记同一条持久通道）。"""
+        content = self.skill_state.get("content")
+        if not content:
+            return None
+
+        name = self.skill_state.get("name", "unknown")
+        return ContextPacket(
+            content=f"[{name}]\n{content}",
+            metadata={"source": "skill", "type": "skill"},
         )
 
     def _build_task_state_packet(self, user_query: str) -> ContextPacket:
@@ -242,6 +262,17 @@ class SpiderContextBuilder(ContextBuilder):
         兼容新版 HelloAgents ContextBuilder，会额外传入 system_instructions。
         """
         sections = []
+
+        # Skill 规程（由 Agent 循环捕获，每轮常驻 system）
+        skill_packets = [
+            p for p in selected_packets
+            if p.metadata.get("type") == "skill"
+        ]
+        if skill_packets:
+            sections.append(
+                "[Skill 规程（必须遵守）]\n"
+                + "\n".join(p.content for p in skill_packets)
+            )
 
         # system_instructions
         instruction_packets = [

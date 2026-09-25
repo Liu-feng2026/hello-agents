@@ -1,7 +1,14 @@
+import asyncio
 import json
+import os
+import re
+import shutil
+import sys
 from datetime import datetime
+from pathlib import Path
 
 from hello_agents import HelloAgentsLLM, ReActAgent, ToolRegistry
+from hello_agents.core.config import Config
 from hello_agents.core.lifecycle import EventType
 from hello_agents.core.message import Message
 from spider_agent.context import SpiderContextBuilder
@@ -17,14 +24,27 @@ Skill 路由规则：本项目默认使用 spider-reverse；用户在任务中�
 
 """
 
+# 淘汰制保留预算：触发淘汰后，历史最多保留这么多 tokens 的近期轮次
+#（可由环境变量 SPIDER_EVICT_RETAIN_TOKENS 覆盖）。
+EVICTION_RETAIN_TOKENS = int(os.getenv("SPIDER_EVICT_RETAIN_TOKENS", "35000"))
+
 
 class SpiderReActAgent(ReActAgent):
     """SpiderAgent 的 ReAct 执行器，负责后续接入上下文工程。"""
 
-    def __init__(self, *args, context_builder=None, note_tool=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        context_builder=None,
+        note_tool=None,
+        skill_state=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.context_builder = context_builder
         self.note_tool = note_tool
+        # 与 ContextBuilder 共享的可变字典：Skill 规程的 system 常驻通道。
+        self._skill_state = skill_state if skill_state is not None else {}
 
     def _build_messages(self, input_text: str):
         """使用 ContextBuilder 构建 SpiderAgent 的消息列表。"""
@@ -48,36 +68,66 @@ class SpiderReActAgent(ReActAgent):
         text = json.dumps(messages, ensure_ascii=False)
         return self.token_counter.count_text(text)
 
+    def _record_skill(self, arguments, content):
+        """Skill 工具调用成功后，把规程内容转入 system 常驻通道。"""
+        if not isinstance(content, str) or not content.strip():
+            return
+
+        name = "unknown"
+        parsed = None
+        if isinstance(arguments, dict):
+            parsed = arguments
+        elif isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed = None
+        if isinstance(parsed, dict):
+            name = str(
+                parsed.get("name")
+                or parsed.get("skill")
+                or parsed.get("skill_name")
+                or "unknown"
+            )
+
+        # SkillTool 返回文本带 <skill-loaded name="..."> 标记，以此校正。
+        match = re.search(r'<skill-loaded name="([^"]+)"', content)
+        if match:
+            name = match.group(1)
+
+        self._skill_state["name"] = name
+        self._skill_state["content"] = content
+        print(f"📖 Skill 规程转入 system 常驻: {name}（{len(content)} 字符）")
+
     def _compress_react_messages(self, messages):
-        """压缩旧工具消息，保留 system、Skill 和最近完整轮次。"""
+        """机械淘汰制：超阈值时保留最近工作集，更老轮次整轮淘汰并放占位符。
+
+        确定性操作，不调用 LLM：持久状态在 system（task_state/Skill 规程），
+        原文在磁盘（evidence/、tool-output/），淘汰只丢"上下文里的原文副本"。
+        """
         threshold = int(
             self.config.context_window
             * self.config.compression_threshold
         )
+        current_tokens = self._estimate_messages_tokens(messages)
 
-        if self._estimate_messages_tokens(messages) <= threshold:
+        if current_tokens <= threshold:
             return messages
 
-        # 第 0 条是每轮重新 build 的最新 system。
+        # 第 0 条是每轮重新 build 的最新 system；
+        # 第 1 条若是上一次的淘汰占位符则替换。
         system_message = messages[0]
         history_start = 1
-        old_summary = ""
-
-        # 第 1 条若是历史摘要，则保留它并在本次压缩时更新。
-        if len(messages) > 1:
-            first_history_message = messages[1]
-            if (
-                first_history_message.get("role") == "system"
-                and first_history_message.get("content", "").startswith(
-                    "[历史工具消息摘要]"
-                )
-            ):
-                old_summary = first_history_message["content"]
-                history_start = 2
+        if (
+            len(messages) > 1
+            and messages[1].get("role") == "system"
+            and messages[1].get("content", "").startswith("[已淘汰历史")
+        ):
+            history_start = 2
 
         history_messages = messages[history_start:]
 
-        # 按 assistant(tool_calls) 划分完整工具轮次。
+        # 按 assistant(tool_calls) 划分完整轮次（原子淘汰，不破坏配对）。
         rounds = []
         current_round = []
 
@@ -90,110 +140,77 @@ class SpiderReActAgent(ReActAgent):
         if current_round:
             rounds.append(current_round)
 
-        keep_rounds = self.config.min_retain_rounds
-        if len(rounds) <= keep_rounds:
+        if not rounds:
             return messages
 
-        cutoff = len(rounds) - keep_rounds
-        compressible_rounds = []
+        # 从最新轮次往回装箱，保留预算内的近期工作集；
+        # 最新一轮无条件保留（它最可能还没落盘）。
         retained_rounds = []
+        retained_tokens = 0
 
-        for index, round_messages in enumerate(rounds):
-            contains_skill = any(
-                tool_call.get("function", {}).get("name", "").lower()
-                == "skill"
-                for message in round_messages
-                if message.get("role") == "assistant"
-                for tool_call in message.get("tool_calls", [])
-            )
+        for round_messages in reversed(rounds):
+            round_tokens = self._estimate_messages_tokens(round_messages)
+            if (
+                retained_rounds
+                and retained_tokens + round_tokens > EVICTION_RETAIN_TOKENS
+            ):
+                break
+            retained_tokens += round_tokens
+            retained_rounds.append(round_messages)
 
-            # Skill 调用所在的完整轮次不压缩。
-            if index >= cutoff or contains_skill:
-                retained_rounds.append(round_messages)
-            else:
-                compressible_rounds.append(round_messages)
+        retained_rounds.reverse()
+        evicted_count = len(rounds) - len(retained_rounds)
 
-        if not compressible_rounds:
+        if evicted_count <= 0:
             return messages
 
-        old_messages = [
+        evicted_messages = [
             message
-            for round_messages in compressible_rounds
+            for round_messages in rounds[:evicted_count]
             for message in round_messages
         ]
+        evicted_span_tokens = self._estimate_messages_tokens(evicted_messages)
 
-        compression_prompt = f"""
-请压缩 SpiderAgent 的旧工具调用历史。
+        tool_counts = {}
+        for message in evicted_messages:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls", []):
+                name = tool_call.get("function", {}).get("name", "?")
+                tool_counts[name] = tool_counts.get(name, 0) + 1
 
-当前 system 中的 task_state 是持久化任务记录，保存任务目标、Step 进度、
-关键发现、阻塞问题、需逆向参数和证据文件路径。
-
-如果旧工具消息中的信息已经记录到 task_state 或证据文件，
-只保留结论，不要重复保留原始输出。
-
-必须保留：
-1. 已完成的工作；
-2. 关键发现和决策；
-3. 当前阻塞；
-4. 尚未完成的下一步；
-5. 需逆向参数结论；
-6. 证据文件路径；
-7. Skill 的关键规则和路线约束。
-
-不要删除或改写 task_state 的 note_id。
-不要生成工具调用，只输出简洁中文摘要。
-
-已有历史摘要：
-{old_summary}
-
-当前 system：
-{system_message.get("content", "")}
-
-需要压缩的旧工具消息：
-{json.dumps(old_messages, ensure_ascii=False)}
-"""
-
-        try:
-            # MVP 直接复用当前已经配置好的主 LLM。
-            response = self.llm.invoke(
-                [
-                    {
-                        "role": "system",
-                        "content": "你是 SpiderAgent 的历史压缩助手。",
-                    },
-                    {
-                        "role": "user",
-                        "content": compression_prompt,
-                    },
-                ],
-                temperature=0.3,
+        tool_summary = ", ".join(
+            f"{name}×{count}"
+            for name, count in sorted(
+                tool_counts.items(), key=lambda item: -item[1]
             )
-            summary = (
-                response.content
-                if hasattr(response, "content")
-                else str(response)
-            ).strip()
-        except Exception as exc:
-            print(f"⚠️ ReAct 历史压缩失败: {exc}")
-            return messages
+        )
 
-        summary_message = {
+        stub_message = {
             "role": "system",
-            "content": "[历史工具消息摘要]\n" + summary,
+            "content": (
+                f"[已淘汰历史] 更早的 {evicted_count} 轮工具调用"
+                f"（约 {evicted_span_tokens} tokens：{tool_summary}）"
+                "已移出上下文。相关结论以 [State] 中的 task_state 为准；"
+                "原始输出已按契约落盘（evidence/ 与 tool-output/），"
+                "需要细节时按文件路径回读切片，不要凭记忆推测。"
+            ),
         }
 
-        # 每个 assistant/tool 轮次整体保留，避免破坏 Function Calling 顺序。
         retained_messages = [
             message
             for round_messages in retained_rounds
             for message in round_messages
         ]
 
-        return [
-            system_message,
-            summary_message,
-            *retained_messages,
-        ]
+        evicted = [system_message, stub_message, *retained_messages]
+        final_tokens = self._estimate_messages_tokens(evicted)
+        print(
+            f"🗜️ 淘汰历史: {current_tokens} -> {final_tokens} tokens，"
+            f"淘汰 {evicted_count} 轮 / 保留 {len(retained_rounds)} 轮"
+            f"（工具: {tool_summary}）"
+        )
+        return evicted
 
     def _run_impl(self, input_text: str, session_start_time, **kwargs) -> str:
         """复用 ReActAgent 工具循环，并在每轮工具完成后刷新 task_state。"""
@@ -328,6 +345,9 @@ class SpiderReActAgent(ReActAgent):
                     result = self._handle_builtin_tool(tool_name, arguments)
                     print(f"🔧 {tool_name}: {result['content']}")
 
+                    if tool_name == "Skill":
+                        self._record_skill(arguments, result.get("content"))
+
                     if self.trace_logger:
                         self.trace_logger.log_event(
                             "tool_result",
@@ -371,6 +391,9 @@ class SpiderReActAgent(ReActAgent):
                 else:
                     print(f"🎬 调用工具: {tool_name}({arguments})")
                     result = self._execute_tool_call(tool_name, arguments)
+
+                    if tool_name == "Skill":
+                        self._record_skill(arguments, result)
 
                     if self.trace_logger:
                         self.trace_logger.log_event(
@@ -564,6 +587,10 @@ class SpiderReActAgent(ReActAgent):
                 )
 
                 # 继续复用框架的异步并行工具执行。
+                call_arguments = {
+                    tool_call.id: tool_call.function.arguments
+                    for tool_call in tool_calls
+                }
                 tool_results = await self._execute_tools_async(
                     tool_calls,
                     current_step,
@@ -571,6 +598,14 @@ class SpiderReActAgent(ReActAgent):
                 )
 
                 for tool_name, tool_call_id, result in tool_results:
+                    if tool_name == "Skill":
+                        self._record_skill(
+                            call_arguments.get(tool_call_id),
+                            result.get("content", str(result))
+                            if isinstance(result, dict)
+                            else str(result),
+                        )
+
                     if tool_name == "Finish" and result.get("finished"):
                         final_answer = result["final_answer"]
                         print(f"🎉 最终答案: {final_answer}")
@@ -621,7 +656,10 @@ class SpiderReActAgent(ReActAgent):
                     }
 
                 # 超过 Token 阈值时压缩旧工具消息。
-                messages = self._compress_react_messages(messages)
+                # 压缩内部会同步调用 LLM，放到线程执行，避免阻塞事件循环。
+                messages = await asyncio.to_thread(
+                    self._compress_react_messages, messages
+                )
 
                 await self._emit_event(
                     EventType.STEP_FINISH,
@@ -673,9 +711,77 @@ class SpiderReActAgent(ReActAgent):
 
 
 
+def _find_npx() -> str:
+    """定位 npx：优先 PATH，其次 fnm 常见安装目录（取版本号最高的一个）。"""
+    npx = shutil.which("npx")
+    if npx:
+        return npx
+
+    fnm_root = Path.home() / ".local" / "share" / "fnm" / "node-versions"
+    if fnm_root.is_dir():
+        candidates = sorted(fnm_root.glob("*/installation/bin/npx"))
+        if candidates:
+            return str(candidates[-1])
+
+    raise RuntimeError(
+        "找不到 npx，请确认 Node.js 已安装且在 PATH 中（fnm 或官方安装均可）。"
+    )
+
+
+def _npx_command(*package_args: str) -> list[str]:
+    """跨平台构造用 npx 启动的 MCP Server 命令。"""
+    if os.name == "nt":
+        # Windows：沿用原 cmd.exe 包装，显式注入 fnm 的 Node 路径。
+        windows_npx_dir = (
+            r"C:\Users\dummy\AppData\Roaming\fnm\node-versions"
+            r"\v24.15.0\installation"
+        )
+        return [
+            "cmd.exe",
+            "/d",
+            "/c",
+            f"set PATH={windows_npx_dir};%PATH%&& "
+            f"{windows_npx_dir}\\npx.cmd -y {' '.join(package_args)}",
+        ]
+
+    # macOS / Linux：直接用 npx 启动。
+    return [_find_npx(), "-y", *package_args]
+
+
+def _python_repl_tool() -> MCPTool:
+    """构造 Python REPL MCP：Windows 用 conda 环境的可执行文件，Mac 用当前 venv。"""
+    if os.name == "nt":
+        return MCPTool(
+            name="python_repl",
+            description=(
+                "用于执行 Python 代码、保持运行状态，并按需安装 Python 依赖。"
+            ),
+            server_command=[
+                "cmd.exe",
+                "/d",
+                "/c",
+                r"set REPL_TIMEOUT=120&& C:\Users\dummy\miniconda3\envs\stage10\Scripts\mcp-python-repl.exe",
+            ],
+        )
+
+    # Mac 上 mcp-python-repl 安装在运行本项目的 venv 中。
+    repl_bin = Path(sys.executable).parent / "mcp-python-repl"
+    return MCPTool(
+        name="python_repl",
+        description=(
+            "用于执行 Python 代码、保持运行状态，并按需安装 Python 依赖。"
+        ),
+        server_command=[str(repl_bin)],
+        env={**os.environ, "REPL_TIMEOUT": "120"},
+    )
+
+
 def create_spider_agent() -> SpiderReActAgent:
     """创建 SpiderAgent。"""
     llm = HelloAgentsLLM()
+
+    # 淘汰制阈值：按 Atria 真实窗口 262k 的 35% ≈ 91.7k tokens 触发。
+    config = Config(context_window=262144, compression_threshold=0.35)
 
     # HelloAgents 会在 Agent 初始化时，把 SkillTool 自动注册到这个工具注册表中。
     tool_registry = ToolRegistry()
@@ -687,12 +793,9 @@ def create_spider_agent() -> SpiderReActAgent:
             "用于读取、搜索、创建和编辑 "
             "SpiderAgent 项目中的本地文件和目录。"
         ),
-        server_command=[
-            "cmd.exe",
-            "/d",
-            "/c",
-            r"set PATH=C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation;%PATH%&& C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation\npx.cmd -y @modelcontextprotocol/server-filesystem .",
-        ],
+        server_command=_npx_command(
+            "@modelcontextprotocol/server-filesystem", "."
+        ),
     )
     tool_registry.register_tool(filesystem)
 
@@ -703,12 +806,7 @@ def create_spider_agent() -> SpiderReActAgent:
             "用于读取和处理 Excel 文件，"
             "支持 xlsx、xlsm、xltx、xltm。"
         ),
-        server_command=[
-            "cmd.exe",
-            "/d",
-            "/c",
-            r"set PATH=C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation;%PATH%&& C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation\npx.cmd -y ms-excel-mcp-server",
-        ],
+        server_command=_npx_command("ms-excel-mcp-server"),
     )
     tool_registry.register_tool(excel)
 
@@ -719,12 +817,7 @@ def create_spider_agent() -> SpiderReActAgent:
             "用于浏览器操作、Network 请求取证、"
             "Console 分析和运行时调试。"
         ),
-        server_command=[
-            "cmd.exe",
-            "/d",
-            "/c",
-            r"set PATH=C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation;%PATH%&& C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation\npx.cmd -y chrome-devtools-mcp --isolated",
-        ],
+        server_command=_npx_command("chrome-devtools-mcp", "--isolated"),
     )
     tool_registry.register_tool(chrome_devtools)
 
@@ -735,37 +828,26 @@ def create_spider_agent() -> SpiderReActAgent:
             "用于 JavaScript 逆向、断点、"
             "调用链、脚本源码和网络请求分析。"
         ),
-        server_command=[
-            "cmd.exe",
-            "/d",
-            "/c",
-            r"set PATH=C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation;%PATH%&& C:\Users\dummy\AppData\Roaming\fnm\node-versions\v24.15.0\installation\npx.cmd -y js-reverse-mcp --isolated",
-        ],
+        server_command=_npx_command("js-reverse-mcp", "--isolated"),
     )
     tool_registry.register_tool(js_reverse)
 
     # Python REPL MCP：执行 Python 代码并保持运行状态。
-    python_repl = MCPTool(
-        name="python_repl",
-        description=(
-            "用于执行 Python 代码、保持运行状态，并按需安装 Python 依赖。"
-        ),
-        server_command=[
-            "cmd.exe",
-            "/d",
-            "/c",
-            r"set REPL_TIMEOUT=120&& C:\Users\dummy\miniconda3\envs\stage10\Scripts\mcp-python-repl.exe",
-        ],
-    )
+    python_repl = _python_repl_tool()
     tool_registry.register_tool(python_repl)
 
     note = NoteTool(workspace="./notes")
     tool_registry.register_tool(note)
 
+    # Agent 与 ContextBuilder 共享同一份可变 Skill 状态，
+    # Skill 工具调用成功后规程内容经此进入每轮重建的 system。
+    skill_state = {}
+
     context_builder = SpiderContextBuilder(
         note_tool=note,
         # 启动时用于一次性匹配已有 task_state。
         llm=llm,
+        skill_state=skill_state,
     )
 
     return SpiderReActAgent(
@@ -773,7 +855,9 @@ def create_spider_agent() -> SpiderReActAgent:
         llm=llm,
         tool_registry=tool_registry,
         system_prompt=SYSTEM_PROMPT,
+        config=config,
         max_steps=150,
         context_builder=context_builder,
         note_tool=note,
+        skill_state=skill_state,
     )
