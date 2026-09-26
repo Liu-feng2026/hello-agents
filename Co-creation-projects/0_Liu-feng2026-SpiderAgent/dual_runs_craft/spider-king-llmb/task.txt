@@ -1,0 +1,10 @@
+目标：采集国家医疗保障局公共服务平台"定点医疗机构查询"页面的公开数据。
+
+主页：https://fuwu.nhsa.gov.cn/nationalHallSt/#/search/medical
+
+要求：
+1. 自行定位页面实际调用的真实业务请求；
+2. 判断请求中的签名/加密参数是否被服务端校验、是否需要逆向；
+3. 交付脱离浏览器的 Python 采集流程（compact-replay 起步，力争 collector）。
+
+明确要求：本次任务必须使用 spider-king Skill。
