@@ -14,6 +14,7 @@ from hello_agents.core.message import Message
 from spider_agent.context import SpiderContextBuilder
 from spider_agent.tools.mcp_tool import MCPTool
 from spider_agent.tools.note_tool import NoteTool
+from spider_agent.truncator import SpiderObservationTruncator
 
 
 SYSTEM_PROMPT = """你是 SpiderAgent（爬虫智能体），负责分析公开网站的数据采集任务。
@@ -41,6 +42,13 @@ class SpiderReActAgent(ReActAgent):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # 用 SpiderAgent 的截断器替换框架默认实现；配置值继续复用框架 Config。
+        self.truncator = SpiderObservationTruncator(
+            max_lines=self.config.tool_output_max_lines,
+            max_bytes=self.config.tool_output_max_bytes,
+            truncate_direction=self.config.tool_output_truncate_direction,
+            output_dir=self.config.tool_output_dir,
+        )
         self.context_builder = context_builder
         self.note_tool = note_tool
         # 与 ContextBuilder 共享的可变字典：Skill 规程的 system 常驻通道。

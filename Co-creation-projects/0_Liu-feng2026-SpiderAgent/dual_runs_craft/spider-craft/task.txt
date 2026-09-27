@@ -1,10 +1,13 @@
-目标：采集国家医疗保障局公共服务平台"定点医疗机构查询"页面的公开数据。
+目标：完成“网洛者 Challenge 6”公开练习接口的最小重放（compact-replay）。
 
-主页：https://fuwu.nhsa.gov.cn/nationalHallSt/#/search/medical
+主页：http://spider.wangluozhe.com/challenge/6
+接口：http://spider.wangluozhe.com/challenge/api/6
 
 要求：
-1. 自行定位页面实际调用的真实业务请求；
-2. 判断请求中的签名/加密参数是否被服务端校验、是否需要逆向；
-3. 交付脱离浏览器的 Python 采集流程（compact-replay 起步，力争 collector）。
+1. 自行定位真实业务请求，确认动态参数及其写入位置；
+2. 分析并本地复现 `hexin-v` 的生成所需逻辑；不得直接复用仓库中的参考实现或硬编码动态值；
+3. 脱离浏览器成功请求第 1 页（`page=1`, `count=10`），保存请求/响应证据；
+4. 交付可重复运行的 Python 最小重放脚本，并说明仍需的 Cookie/会话前置条件；
+5. 只访问该公开练习站点，限速、单页验证即可。
 
-明确要求：本次任务必须使用 spider-craft Skill。
+明确要求：本次任务必须使用 spider-craft Skill，并将证据、结论和失败原因写入任务目录。
